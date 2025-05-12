@@ -7,7 +7,7 @@ from entnode_prefilter import EntityNodeFilter
 from data_preprocess import generate_token_labels
 from utils import get_topk_candidates, build_bipartite_graph, TextEncoder
 from triplet_scorer import BERTTripleScorer, extract_candidate_triples, node_id_to_token_map, convert_id_triples_to_text, split_triples_by_score
-from llm_guidance import TripleSetEncoder,verbalize_triples, dpo_alignment_loss, ask_llm_preference
+from llm_guidance import TripleSetEncoder,verbalize_triples, preference_learning_loss, ask_llm_preference
 
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -134,7 +134,7 @@ print("Top triple set →", sim_top.item())
 print("Bottom triple set →", sim_btm.item())
 
 
-# verbalize
+# verbalize _ 단순 이어붙이는 형태?
 summary_top = verbalize_triples(top_triples)
 summary_btm = verbalize_triples(bottom_triples)
 
@@ -143,7 +143,9 @@ print("summary_top: ", summary_top)
 print("summary_btm: ", summary_btm)
 
 # LLM으로 선호도 평가 받기
+# "A" 또는 "B"
 preferred = ask_llm_preference(flattened_sentences, summary_top, summary_btm)
 
 # DPO-style loss 계산
-loss = dpo_alignment_loss(sim_top, sim_btm, preferred)
+#! token-lvel preference learning loss
+tok_pf_loss = preference_learning_loss(sim_top, sim_btm, preferred)

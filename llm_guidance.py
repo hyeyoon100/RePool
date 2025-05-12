@@ -4,6 +4,7 @@ from transformers import AutoModel, AutoTokenizer
 from typing import List, Tuple
 
 
+
 class TripleSetEncoder(nn.Module):
     def __init__(self, model_name: str = "bert-base-cased"):
         super().__init__()
@@ -42,10 +43,11 @@ def verbalize_triples(triples: List[Tuple[str, str, str]]) -> str:
     return " ".join([f"{h} {r.replace('_', ' ')} {t}." for h, r, t in triples])
 
 
-def dpo_alignment_loss(sim_a, sim_b, preferred: str, tau=0.1):
+def preference_learning_loss(sim_a, sim_b, preferred: str, tau=0.1):
     """
     Compute DPO-style preference loss between two cosine similarities.
     """
+    # cosine similarity 점수 자체가 1 또는 0에 가까워지도록 학습
     sims = torch.stack([sim_a, sim_b]) / tau
     label = torch.tensor(0 if preferred == "A" else 1, device=sims.device)
     return nn.functional.cross_entropy(sims.unsqueeze(0), label.unsqueeze(0))
@@ -59,13 +61,46 @@ def ask_llm_preference(input_text: str, summary_a: str, summary_b: str) -> str:
     For now, returns random choice for testing.
     """
     # TODO: Replace with actual LLM call
+    prompt = f"""
+        You are given an input text and two generated summaries.
+
+        Input Text:
+        "{input_text}"
+
+        Summary A:
+        "{summary_a}"
+
+        Summary B:
+        "{summary_b}"
+
+        Question:
+        Which summary (A or B) better captures the information in the Input Text? Please answer "A" or "B" only.
+    """
+    response = openai.ChatCompletion.create(
+        model="gpt-4",
+        messages=[
+            {"role": "user", "content": prompt}
+        ],
+        temperature=0  # deterministic 답변을 유도
+    )
+
+    answer = response['choices'][0]['message']['content'].strip()
+    # return answer
+
+    # A: prefer. B: disprefer
+    #! 자동화된 방향 선택 _ bottom을 prefer로 선택하면 순서 바꿔줌
+    # if preferred == "A":
+    #     loss = dpo_loss(sim_top, sim_bot)
+    # else:
+    #     loss = dpo_loss(sim_bot, sim_top)
+
     return random.choice(["A", "B"])
 
 
 #! 저번에 짜둔 것. 현 모델에 맞추어 개선하기
-openai.api_key = "YOUR_OPENAI_API_KEY"
+# openai.api_key = "YOUR_OPENAI_API_KEY"
 
-def ask_llm_preference(input_text, summary_a, summary_b):
+# def ask_llm_preference(input_text, summary_a, summary_b):
 #     prompt = f"""
 # You are given an input text and two generated summaries.
 
