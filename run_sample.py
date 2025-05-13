@@ -5,7 +5,7 @@ from torch.nn.utils.rnn import pad_sequence
 from token_rep import EntityTokenRep, RelationTokenRep
 from entnode_prefilter import EntityNodeFilter
 from data_preprocess import generate_token_labels
-from utils import get_topk_candidates, build_bipartite_graph, TextEncoder
+from utils import get_topk_candidates, build_bipartite_graph, TextEncoder, sample_triples
 from triplet_scorer import BERTTripleScorer, extract_candidate_triples, node_id_to_token_map, convert_id_triples_to_text, split_triples_by_score
 from llm_guidance import TripleSetEncoder,verbalize_triples, preference_learning_loss, ask_llm_preference
 
@@ -26,7 +26,11 @@ sentences = sample["sentences"]
 ner_spans = sample["ner"]
 
 # input text 임베딩
-flattened_sentences = [" ".join(s) for s in sentences]
+# flattened_sentences = [" ".join(s) for s in sentences]
+# input_text = " ".join([" ".join(sent) for sent in sentences])
+flattened_sentences = " ".join(" ".join(sent) for sent in sentences)
+
+
 text_encoder = TextEncoder("bert-base-cased").to(device)
 input_text_embedding = text_encoder(flattened_sentences)
 
@@ -39,7 +43,7 @@ labels = generate_token_labels(sentences, ner_spans)  # List[List[int]]
 lengths = torch.tensor([len(s) for s in sentences])
 
 
-# === 모델 구성 ===
+# === 모델 구성 === (__init__)
 token_model = EntityTokenRep(model_name="bert-base-cased")
 relation_model = RelationTokenRep(num_relations=len(relation_types),
                                 embedding_dim=768,
@@ -47,6 +51,8 @@ relation_model = RelationTokenRep(num_relations=len(relation_types),
                                 relation_names=relation_types
                             )
 filter_model = EntityNodeFilter(hidden_size=768)
+
+tripleset_encoder = TripleSetEncoder("bert-base-cased").to(device)
 
 # === Token 임베딩 ===
 out = token_model(sentences, lengths)
@@ -80,17 +86,17 @@ scores, prefilter_loss = filter_model(flat_entity_emb.unsqueeze(0), labels=flat_
 
 #~ original tokens에서 탈락한 노드는 keep_mask 할당해서 엣지 생성 제한하는 형태
 # scores: [B, L]
-topk = 7
+topk = 10
 sorted_idx = torch.argsort(scores, dim=1, descending=True)
 keep_mask = torch.zeros_like(scores)  # [B, L]
 keep_mask.scatter_(1, sorted_idx[:, :topk], 1)  # 상위 topk만 1로 유지
-
 
 # === bidirectional complete bipartite graph 생성 ===
 # top-k만 relation과 edge 생성, 탈락된 토큰은 isolate node로 존재
 # entity_emb = embeddings[0]
 keep_ids = (keep_mask[0] == 1).nonzero(as_tuple=True)[0].tolist()
 data = build_bipartite_graph(flat_entity_emb, keep_ids, rel_emb, bidirectional=True)
+
 
 # Output:
 # Data(x=[17, 768], edge_index=[2, 140], edge_type=[140], node_type=[17])
@@ -99,6 +105,7 @@ triples = extract_candidate_triples(data)
 node_id_to_token = node_id_to_token_map(entity_tokens, relation_types)
 text_triples = convert_id_triples_to_text(triples, node_id_to_token)
 
+print('triples 개수: ', len(triples))
 
 scorer = BERTTripleScorer("bert-base-cased")
 token_level_scores = scorer(text_triples)
@@ -106,7 +113,7 @@ token_level_scores = scorer(text_triples)
 top_triples, top_scores, bottom_triples, bottom_scores = split_triples_by_score(
     text_triples,
     token_level_scores,
-    top_k=10
+    top_k=30
 )
 
 print("🔼 Top triples:")
@@ -118,7 +125,17 @@ for t, s in zip(bottom_triples[:5], bottom_scores[:5]):  # 5개만
     print(f"{t} → {s.item():.4f}")
 
 
-tripleset_encoder = TripleSetEncoder("bert-base-cased").to(device)
+# 각 top-k, bottom triples에서 일부만 랜덤하게 샘플링
+sample_size = 20  # 나중에 비율 형태로 변경
+
+top_triples, top_scores = sample_triples(top_triples, top_scores, sample_size)
+bottom_triples, bottom_scores = sample_triples(bottom_triples, bottom_scores, sample_size)
+
+# 이제 encode_triple_set에 넣기
+top_vector = tripleset_encoder.encode_triple_set(top_triples)
+bottom_vector = tripleset_encoder.encode_triple_set(bottom_triples)
+
+
 
 # top_triples, bottom_triples 입력
 top_vector = tripleset_encoder.encode_triple_set(top_triples)      # [H]
@@ -129,18 +146,18 @@ cos = torch.nn.CosineSimilarity(dim=-1)
 sim_top = cos(input_text_embedding, top_vector)
 sim_btm = cos(input_text_embedding, bottom_vector)
 
-print("Cosine similarity to input text:")
-print("Top triple set →", sim_top.item())
-print("Bottom triple set →", sim_btm.item())
+# print("Cosine similarity to input text:")
+# print("Top triple set →", sim_top.item())
+# print("Bottom triple set →", sim_btm.item())
 
 
 # verbalize _ 단순 이어붙이는 형태?
 summary_top = verbalize_triples(top_triples)
 summary_btm = verbalize_triples(bottom_triples)
 
-print("================")
-print("summary_top: ", summary_top)
-print("summary_btm: ", summary_btm)
+# print("================")
+# print("summary_top: ", summary_top)
+# print("summary_btm: ", summary_btm)
 
 # LLM으로 선호도 평가 받기
 # "A" 또는 "B"

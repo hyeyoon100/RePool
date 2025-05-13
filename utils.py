@@ -4,7 +4,7 @@ from torch_geometric.data import Data
 from torch.nn.utils.rnn import pad_sequence
 from transformers import AutoModel, AutoTokenizer
 from typing import List
-
+import random
 
 def get_topk_candidates(scores, candidates, topk):
     """
@@ -121,3 +121,26 @@ class TextEncoder(nn.Module):
         outputs = self.encoder(input_ids=input_ids, attention_mask=attention_mask)
         cls_embedding = outputs.last_hidden_state[:, 0]  # [B, H]
         return cls_embedding.squeeze(0)  # [H]
+
+
+#* triple set에서 일정 수의 트리플 랜덤하게 샘플링
+def sample_triples(triples, scores, sample_size):   # random sampling
+    """
+    Args:
+        triples: List[Tuple[str, str, str]]
+        scores: List[float] or Tensor
+        sample_size: int
+
+    Returns:
+        sampled_triples, sampled_scores
+    """
+    if len(triples) <= sample_size:
+        return triples, scores  # 샘플 수보다 작으면 그대로 반환
+
+    indices = random.sample(range(len(triples)), sample_size)
+    sampled_triples = [triples[i] for i in indices]
+    if isinstance(scores, torch.Tensor):    # 왜 필요?
+        sampled_scores = scores[indices]
+    else:
+        sampled_scores = [scores[i] for i in indices]
+    return sampled_triples, sampled_scores
