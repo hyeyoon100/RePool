@@ -1,1 +1,5 @@
 .env
+train.log
+/data
+/checkpoints
+__pycache__
