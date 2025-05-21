@@ -30,12 +30,16 @@ class SciERCDataset(Dataset):
         if "relations" in item and item["relations"]:
             rel_ids = [self.relation2id[r[-1]] for rels in item["relations"] for r in rels]
             relation_ids = list(set(rel_ids))
-            
+
+        rels = item.get("relations", [])
+        if rels is None:
+            rels = []    
+        
         return {
             "tokens": tokens,
             "sentences": item["sentences"],
             "ner": item.get("ner", []),
-            "relations": item.get("relations", []),
+            "relations": rels,
             "relation_ids": relation_ids,
             "length": len(tokens)
         }
@@ -48,6 +52,7 @@ def collate_fn(batch):
     sentences_list = [item['sentences'] for item in batch]
     ner_list = [item['ner'] for item in batch]
     relation_ids_list = [item['relation_ids'] for item in batch]
+    relations_list = [item['relations'] for item in batch]
     lengths_list = [item['length'] for item in batch]
     
     # lengths를 텐서로 변환
@@ -59,6 +64,7 @@ def collate_fn(batch):
         "sentences": sentences_list,
         "lengths": lengths_tensor,
         "relation_ids": relation_ids_list,
+        "relations": relations_list,
         "ner": ner_list,
         "batch_size": len(batch)
     }

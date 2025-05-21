@@ -7,9 +7,10 @@ from modules import (
     Token_Level_Graph_Pooling,
     Token_to_Span_Composition,
     Span_level_Graph_Pooling,
-    Prediction
+    # RePoolPredictor
 )
 from prediction import NERPredictor, REPredictor, REPlusPredictor, predict_relations
+from loss_functions import flatten_gold_relations, RelationLoss
 
 class RePoolModel(nn.Module):
     def __init__(
@@ -60,7 +61,7 @@ class RePoolModel(nn.Module):
         # Prediction 모듈 초기화
         self.id2label = {i: label for i, label in enumerate(self.relation_types)}
         self.ner_predictor = NERPredictor(id2label=self.id2label)
-        self.re_predictor = REPredictor(threshold=0.5)
+        self.re_predictor = REPredictor(threshold=0.3)
         self.replus_predictor = REPlusPredictor(threshold=0.6, id2label=self.id2label)
         
         self.repool_predictor = None  # 나중에 relation_types가 정해진 후 초기화
@@ -109,6 +110,7 @@ class RePoolModel(nn.Module):
         # 4. Token Level Processing
         graph, triples, triple_cls_vectors, top_triples, top_scores, bottom_triples, bottom_scores, top_indices, bottom_indices = self.token_level.process_token_triples(graph)
 
+
         # 5. Token Level LLM Alignment & Aggregation
         if top_triples is None or len(top_triples) == 0 or triple_cls_vectors is None or len(top_indices) == 0:
             token_level_llm_loss = torch.tensor(0.0, requires_grad=True, device=self.device)
@@ -150,15 +152,19 @@ class RePoolModel(nn.Module):
         # 7. Span Level Processing (if valid spans exist)
         span_level_outputs = None
         predictions = []
+
         if span_ids is not None and candidate_spans is not None and len(candidate_spans) > 0 and span_embs is not None:
             result = self.span_level.process_span_triples(graph, candidate_spans, span_ids, span_embs, rel_emb)
+            print(f"[DEBUG-SPAN] result: {result}")
             if result is None:
+                print("[DEBUG-SPAN] process_span_triples 반환값이 None입니다.")
                 span_level_llm_loss = torch.tensor(0.0, requires_grad=True, device=self.device)
                 span_top_triples = span_top_scores = span_id_to_token_indices = None
             else:
                 (candidate_triples,triple_cls_vectors, span_top_triples, span_top_scores, 
                  span_bottom_triples, span_bottom_scores, span_top_indices, 
                  span_bottom_indices, span_id_to_token_indices) = result
+
                 if span_top_triples is None or len(span_top_triples) == 0 or triple_cls_vectors is None or len(span_top_indices) == 0:
                     span_level_llm_loss = torch.tensor(0.0, requires_grad=True, device=self.device)
                 else:
@@ -182,51 +188,78 @@ class RePoolModel(nn.Module):
                         triple_cls_vectors,
                         span_top_indices
                     )
-            # 8. 예측 및 loss 통합 처리
-            #   relation_indices = [i - num_tokens for i, t in enumerate(graph.node_type) if t == 1]
+
+
+            flat_gold_relations = flatten_gold_relations(sample.get("relations", []), sample["sentences"])
+
+            # 8. 예측 및 loss 통합 처리 (RePoolPredictor 제거, 직접 REPredictor와 flatten_gold_relations 사용)
             try:
-                if self.repool_predictor is None:
-                    from modules import RePoolPredictor
-                    self.repool_predictor = RePoolPredictor(self.relation_types, device=self.device)
-                outputs = self.repool_predictor.predict_and_loss(
-                    sample=sample,
-                    graph=graph,
-                    span_top_triples=span_top_triples,
-                    span_top_scores=span_top_scores,
-                    token_to_text=token_to_text,
+                # gold_relations flatten
+                # flat_gold_relations = flatten_gold_relations(sample.get("relations", []), sample["sentences"])
+
+                # 예측
+                # re_predictor = REPredictor(threshold=0.1)
+                relation_indices = [i - num_tokens for i, t in enumerate(graph.node_type) if t == 1]
+                predictions = self.re_predictor.predict(
                     num_tokens=num_tokens,
-                    gold_relations=sample.get("relations", []),
-                    sentences=sample["sentences"],
-                    prefilter_loss=prefilter_loss,
-                    span_prefilter_loss=span_prefilter_loss,
-                    token_level_llm_loss=token_level_llm_loss,
-                    span_level_llm_loss=span_level_llm_loss
+                    span_triples=span_top_triples if span_top_triples is not None else [],
+                    span_scores=span_top_scores if span_top_scores is not None else torch.tensor([], device=self.device),
+                    token_to_text=token_to_text,
+                    relation_indices=relation_indices
+                )
+                # 디버깅: 예측 결과, gold label, loss 출력
+                print("[DEBUG-PREDICTION] predictions:", predictions)
+                print("[DEBUG-PREDICTION] gold_relations(flat):", flat_gold_relations)
+                # loss 계산
+                relation_loss_fn = RelationLoss(relation_types=self.relation_types, device=self.device)
+                relation_loss_val = relation_loss_fn(
+                    predictions,
+                    flat_gold_relations
+                )
+                print("[DEBUG-PREDICTION] relation_loss_val:", relation_loss_val)
+                # 최종 loss 합산
+                final_loss_val = (
+                    prefilter_loss +
+                    (span_prefilter_loss if span_prefilter_loss is not None else 0.0) +
+                    token_level_llm_loss +
+                    span_level_llm_loss +
+                    relation_loss_val
                 )
             except Exception as e:
-                print(f"[Warning] RePoolPredictor 예외 발생: {e}")
-                outputs = {
-                    "predictions": [],
-                    "relation_loss": torch.tensor(0.0, requires_grad=True, device=self.device),
-                    "prefilter_loss": prefilter_loss,
-                    "span_prefilter_loss": span_prefilter_loss,
-                    "token_level_llm_loss": token_level_llm_loss,
-                    "span_level_llm_loss": span_level_llm_loss,
-                    "final_loss": prefilter_loss + (span_prefilter_loss if span_prefilter_loss is not None else 0.0) + token_level_llm_loss + span_level_llm_loss
-                }
+                print(f"[Warning] 예측/로스 계산 예외 발생: {e}")
+                relation_loss_val = torch.tensor(0.0, requires_grad=True, device=self.device)
+                predictions = []
+                final_loss_val = (
+                    prefilter_loss +
+                    (span_prefilter_loss if span_prefilter_loss is not None else 0.0) +
+                    token_level_llm_loss +
+                    span_level_llm_loss
+                )
+            
             span_level_outputs = {
                 "span_level_llm_loss": span_level_llm_loss,
-                "relation_loss": outputs["relation_loss"],
-                "predictions": outputs["predictions"],
+                "relation_loss": relation_loss_val,
+                "predictions": predictions,
                 "graph": graph,
                 "span_triples": span_top_triples,
                 "span_scores": span_top_scores,
                 "span_id_to_token_indices": span_id_to_token_indices,
-                "span_prefilter_loss": span_prefilter_loss
+                "span_prefilter_loss": span_prefilter_loss,
             }
         else:
+            print("[DEBUG-SPAN] span_level_llm_loss: 0.0 ========== excp")
             span_level_llm_loss = torch.tensor(0.0, requires_grad=True, device=self.device)
             relation_loss_val = torch.tensor(0.0, requires_grad=True, device=self.device)
             predictions = []
+            final_loss_val = (
+                prefilter_loss +
+                (span_prefilter_loss if span_prefilter_loss is not None else 0.0) +
+                token_level_llm_loss +
+                span_level_llm_loss
+            )
+            span_level_outputs = None
+        
+        print(f"[DEBUG] predictions: {predictions}")
 
         return {
             "graph": graph,
@@ -234,18 +267,18 @@ class RePoolModel(nn.Module):
             "span_prefilter_loss": span_prefilter_loss,
             "token_level_llm_loss": token_level_llm_loss,
             "span_level_outputs": span_level_outputs,
+            "relation_loss": relation_loss_val,
             "predictions": {
-                "re": outputs["predictions"] if span_level_outputs is not None else []
+                "re": predictions
             },
-            "final_loss": outputs["final_loss"] if span_level_outputs is not None else (
-                prefilter_loss + (span_prefilter_loss if span_prefilter_loss is not None else 0.0) + token_level_llm_loss + span_level_llm_loss
-            )
+            "final_loss": final_loss_val
         }
 
     def forward(self, batch: Dict[str, Any]) -> Dict[str, Any]:
         """배치 단위 처리를 robust하게 수행합니다."""
         batch_size = len(batch["sentences"])
         batch_outputs = []
+
         for i in range(batch_size):
             sample = {
                 "sentences": batch["sentences"][i],
@@ -258,13 +291,17 @@ class RePoolModel(nn.Module):
             outputs = self.process_single_sample(sample)
             batch_outputs.append(outputs)
             print(f"[Batch {i}] Loss: {outputs.get('final_loss', 'N/A')}")
+            print(f"[Batch {i}] predictions: {outputs.get('predictions', None)}")
+            
         # Loss 취합
         def to_tensor(val, device):
             if isinstance(val, torch.Tensor):
-                return val
+                # 빈 텐서나 1차원 텐서 모두 스칼라로 squeeze
+                return val.squeeze() if val.numel() == 1 else val
             else:
                 return torch.tensor(val, device=device)
 
+        print(f"======================[DEBUG] outputs['predictions']: {outputs['predictions']}")
         total_entity_prefilter_loss = torch.stack(
             [to_tensor(out["entity_prefilter_loss"], self.device) for out in batch_outputs]
         ).mean()
@@ -299,5 +336,8 @@ class RePoolModel(nn.Module):
             "span_prefilter_loss": total_span_prefilter_loss,
             "token_level_llm_loss": total_token_level_llm_loss,
             "span_level_llm_loss": total_span_level_llm_loss,
-            "relation_loss": total_relation_loss
+            "relation_loss": total_relation_loss,
+            "predictions": [out["predictions"]["re"] for out in batch_outputs]  # ← 추가!
         }
+
+

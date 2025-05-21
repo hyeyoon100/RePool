@@ -10,6 +10,8 @@ from pathlib import Path
 
 from model import RePoolModel
 from data_loader import SciERCDataset, collate_fn
+from evaluator import Evaluator
+from loss_functions import flatten_gold_relations
 
 # 토크나이저 병렬처리 비활성화
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -46,9 +48,11 @@ def train_epoch(model, train_loader, optimizer, device, epoch):
         logger.info(f"Epoch {epoch+1} Batch {batch_idx+1} Loss: {loss.item():.4f}")
         # 필요하다면 세부 loss도 함께
         logger.info(
-            f"Entity: {outputs['entity_prefilter_loss'].item():.4f}, "
+            f"Entity Prefilter: {outputs['entity_prefilter_loss'].item():.4f}, "
             f"Token LLM: {outputs['token_level_llm_loss'].item():.4f}, "
+            f"Span Prefilter: {outputs['span_prefilter_loss'].item():.4f}, "
             f"Span LLM: {outputs['span_level_llm_loss'].item():.4f}"
+            f"final loss: {outputs['final_loss'].item():.4f}"
         )
         
         # Backward pass
@@ -94,11 +98,13 @@ def evaluate(model, eval_loader, device):
             
             outputs = model(batch)
             total_loss += outputs["final_loss"].item()
+
+            total_predictions.extend(outputs["predictions"])
             
             # 예측 결과 수집
-            for batch_output in outputs["batch_outputs"]:
-                predictions = batch_output["predictions"]
-                total_predictions.extend(predictions["re"])  # RE 예측만 수집
+            # for batch_output in outputs["batch_outputs"]:
+            #     predictions = batch_output["predictions"]
+            #     total_predictions.extend(predictions["re"])  # RE 예측만 수집
     
     avg_loss = total_loss / len(eval_loader)
     return avg_loss, total_predictions
@@ -114,7 +120,7 @@ def main():
         # 학습 설정
         'learning_rate': 2e-5,
         'batch_size': 8,
-        'num_epochs': 2,
+        'num_epochs': 1,
         'num_workers': 4,
         
         # 데이터 설정
@@ -218,6 +224,21 @@ def main():
         with open(predictions_path, 'w') as f:
             json.dump(predictions, f, indent=2)
         logger.info(f"Saved predictions to {predictions_path}")
+
+        # === Test set 평가 및 로그 기록 ===
+        # gold label 준비
+        test_gold = []
+        for sample in test_dataset:
+            flat_gold = flatten_gold_relations(sample["relations"], sample["sentences"])
+            test_gold.append(flat_gold)
+        # predictions 포맷 맞추기 (리스트의 리스트)
+        test_predictions = predictions
+        if test_predictions and isinstance(test_predictions[0], (str, list, tuple)) and not isinstance(test_predictions[0], list):
+            test_predictions = [test_predictions]
+        # 평가
+        evaluator = Evaluator(test_gold, test_predictions)
+        output_str, f1 = evaluator.evaluate()
+        logger.info(f"Test set evaluation: {output_str}")
 
 if __name__ == "__main__":
     main()

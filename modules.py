@@ -13,7 +13,7 @@ from prefilter import TokenFilter, SpanFilter  # 엔티티/스팬 필터
 from utils import build_bipartite_graph, get_candidate_spans, sample_triples, TextEncoder, create_span_relation_edges, get_span_embeddings, extract_token_relation_edges, filter_candidate_spans
 from triplet_scorer import extract_candidate_triples, BERTTripleScorer, split_triples_by_score, remove_edges_of_bottom_triples, node_id_to_token_map, convert_id_triples_to_text, extract_span_token_candidate_triples, convert_span_triples_to_text, remove_edges_of_bottom_token_triples
 from llm_guidance import TripleSetEncoder, verbalize_triples, preference_learning_loss, ask_llm_preference   # LLM-guided alignment/loss
-from aggregation import EntityEmbeddingUpdater, RelationEmbeddingUpdater   # aggregation
+# from aggregation import EntityEmbeddingUpdater, RelationEmbeddingUpdater   # aggregation
 from prediction import predict_relations
 from loss_functions import RelationLoss, flatten_gold_relations
 from prediction import REPredictor
@@ -143,14 +143,6 @@ class Dual_View_BipartiteKG_Construction(nn.Module):
         keep_ids = (flat_keep_mask == 1).nonzero(as_tuple=True)[0].tolist()
         flat_keep_mask = flat_keep_mask.tolist()
 
-        print(f"\n=== 그래프 구축 입력 디버깅 ===")
-        print(f"Flattened entity embeddings shape: {flat_entity_embs.shape}")
-        print(f"Relation embeddings shape: {rel_emb.shape}")
-        print(f"All node embeddings size: {all_node_emb.size()}")
-        print(f"Total actual length: {sum(length.item() for length in actual_entity_length)}")
-        print(f"Number of relations: {num_relation}")
-
-
         graph = build_bipartite_graph(all_node_emb, keep_ids, num_relation, bidirectional=True, keep_mask=flat_keep_mask)
         
         print("graph: ", graph)
@@ -167,7 +159,7 @@ class Token_Level_Graph_Pooling(nn.Module):
         self.edge_types = ["can_form_subject_of", "can_form_object_of", "can_form_compound_with"]
         self.edgetype_rep = EdgeTypeRep(self.edge_types, lm_model_name=bert_model_name, freeze_bert=True).to(self.device)
         self.triple_scorer = BERTTripleScorer(hidden_size=768).to(self.device)
-        self.pooling_threshold = 0.2
+        self.pooling_threshold = 0.1
 
         self.tripleset_encoder = TripleSetEncoder(hidden_size=hidden_size).to(self.device)
         self.text_encoder = TextEncoder(model_name=bert_model_name).to(self.device)
@@ -281,11 +273,6 @@ class Token_Level_Graph_Pooling(nn.Module):
         
         input_text_embs = torch.stack(input_text_embs, dim=0).to(self.device)  # [B, H]
         
-        print(f"\n=== Input Text Embedding 생성 ===")
-        print(f"배치 크기: {input_text_embs.size(0)}")
-        print(f"임베딩 차원: {input_text_embs.size(1)}")
-
-        print('top_triples: ', len(top_triples))
 
         input_text_emb = input_text_embs.mean(dim=0)  # [H]
         
@@ -357,7 +344,6 @@ class Token_Level_Graph_Pooling(nn.Module):
             triple_cls_vectors: [num_triples, hidden_size] - 트리플별 CLS 벡터
             top_indices: List[int] - 상위 트리플의 인덱스 리스트
         """
-        print(f"\n=== Token-Level Validity-Aware Aggregation ===")
         device = graph.x.device
         # 상위 트리플의 CLS 벡터 추출
         top_cls_vectors = triple_cls_vectors[top_indices].to(device)  # [K, D]
@@ -375,7 +361,7 @@ class Token_Level_Graph_Pooling(nn.Module):
                 for i, idx in enumerate(top_indices):
                     h, _, _ = triples[idx]
                     if h == node_id:
-                        print("%%%%% head node update: ", node_id)
+                        # print("%%%%% head node update: ", node_id)
                         selected_cls.append(top_cls_vectors[i])
                 if len(selected_cls) > 0:
                     cls_tensor = torch.stack(selected_cls, dim=0)  # [K, D]
@@ -391,8 +377,7 @@ class Token_Level_Graph_Pooling(nn.Module):
 
         # 최종 업데이트된 임베딩을 그래프에 반영
         graph.x = updated_node_emb
-        print(f"노드 임베딩 업데이트 완료 (token-level)")
-        print(f"전체 노드 임베딩 크기: {graph.x.size()}")
+
         return graph
 
 
@@ -443,7 +428,6 @@ class Token_to_Span_Composition(nn.Module):
         token_mask = (graph.node_type == 0)
         token_embeddings = graph.x[token_mask]  # [num_tokens, D]
         
-        print(f"토큰 임베딩 크기: {token_embeddings.shape}")
         
         span_embs = get_span_embeddings(
             token_embeddings=token_embeddings,  # 토큰 노드의 임베딩만 사용
@@ -475,7 +459,6 @@ class Token_to_Span_Composition(nn.Module):
         span_embs = span_embs[selected_indices]
         
         print(f"필터링 후 span 수: {len(candidate_spans)}")
-        print(f"Span 임베딩 크기: {span_embs.shape}")
         
         if len(candidate_spans) == 0:
             print("스킵: 필터링 후 유효한 span이 없습니다.")
@@ -495,8 +478,6 @@ class Token_to_Span_Composition(nn.Module):
         
         print("token_rel_edges:", token_rel_edges)
         print("edge_index:", graph.edge_index)
-        print(f"edge_index.size(1): {graph.edge_index.size(1)}")
-        print(f"node_type size: {len(graph.node_type)}")
         print(f"추출된 token-relation 엣지 수: {len(token_rel_edges)}")
         
         span_rel_edges = create_span_relation_edges(
@@ -520,7 +501,7 @@ class Token_to_Span_Composition(nn.Module):
         new_edge_types = []
         
         # 양방향 엣지 추가 (semantic type = 2)
-        for span_id, rel_id, rel_node_id in span_rel_edges:
+        for span_id, rel_id, rel_node_id, edge_type in span_rel_edges:
             # span → relation
             new_edges.append([span_id, rel_node_id])
             new_edge_types.append(2)  # semantic type
@@ -573,9 +554,9 @@ class Span_level_Graph_Pooling(nn.Module):
         self.tripleset_encoder = TripleSetEncoder(hidden_size=hidden_size).to(self.device)
         self.text_encoder = TextEncoder(model_name=bert_model_name).to(self.device)
 
-        self.update_entity_embedding = EntityEmbeddingUpdater(hidden_dim=hidden_size).to(self.device)
-        self.update_relation_embedding = RelationEmbeddingUpdater(hidden_dim=hidden_size).to(self.device)
-
+        # Linear transformations for entity and relation updates
+        self.entity_linear = nn.Linear(hidden_size, hidden_size).to(self.device)
+        self.relation_linear = nn.Linear(hidden_size, hidden_size).to(self.device)
         
         # 기타 설정
         self.pooling_threshold = 0.1
@@ -585,54 +566,49 @@ class Span_level_Graph_Pooling(nn.Module):
     def process_span_triples(self, graph, candidate_spans, span_ids, span_embs, rel_emb):
         """
         스팬 레벨 트리플을 처리합니다.
-        
         Args:
             graph: 그래프 데이터
             candidate_spans: 스팬 후보 리스트 [(start, end), ...]
             span_ids: 스팬 노드 ID 리스트
             span_embs: 스팬 임베딩 [num_spans, D]
         """
-        print(f"\n=== Span Triple Processing ===")
-        print(f"Input spans: {len(candidate_spans)}")
-        print(f"Span embeddings: {span_embs.shape}")
-        
         # 1. 토큰 노드 ID 추출
         token_mask = (graph.node_type == 0)
         token_ids = torch.where(token_mask)[0].tolist()
-        
         # 2. 스팬-토큰 매핑 생성
         span_id_to_token_indices = {
             span_id: list(range(start, end + 1))
             for span_id, (start, end) in zip(span_ids, candidate_spans)
         }
-        
-        # 3. 토큰-관계 엣지 추출
-        token_rel_edges = extract_token_relation_edges(graph)  # (token_id, rel_id, rel_node_id)
-        
-        # 4. 스팬-관계 매핑 생성
-        span_relation_candidates = defaultdict(set)
-        for token_id, rel_id, rel_node_id in token_rel_edges:
-            for span_id, token_indices in span_id_to_token_indices.items():
-                if token_id in token_indices:
-                    span_relation_candidates[span_id].add(rel_id)
-        
+        # 3. 토큰-관계 엣지 추출 (edge_type까지)
+        token_rel_edges = extract_token_relation_edges(graph)  # (token_id, rel_id, rel_node_id, edge_type)
+        # 4. 노드-관계 매핑 생성 (token + span 모두)
+        from collections import defaultdict
+        node_relation_candidates = defaultdict(lambda: defaultdict(set))  # {node_id: {edge_type: set(rel_id)}}
+        # token 노드: 직접 연결된 edge_type별 relation
+        for token_id, rel_id, rel_node_id, edge_type in token_rel_edges:
+            node_relation_candidates[token_id][edge_type].add(rel_id)
+        # span 노드: 내부 토큰의 relation 후보를 모아서 edge_type별로 합침
+        for span_id, token_indices in span_id_to_token_indices.items():
+            for edge_type in [0, 1]:
+                rels = set()
+                for token_id in token_indices:
+                    rels |= node_relation_candidates[token_id][edge_type]
+                if rels:
+                    node_relation_candidates[span_id][edge_type] = rels
         #* 노드 타입에 따라 임베딩 분리
-
         # 5. 트리플 후보 생성 (이제 rel_type 포함)
         candidate_triples = extract_span_token_candidate_triples(
             token_ids=token_ids,
             span_ids=span_ids,
-            span_relation_candidates=span_relation_candidates,
+            node_relation_candidates=node_relation_candidates,
             span_id_to_token_indices=span_id_to_token_indices,
             relation_types=self.relation_types
         )
-        
         if not candidate_triples:
             print("스킵: 유효한 triple이 없습니다.")
             return None, None, None, None, None, None, None, None, None
-        
         #* 트리플 CLS 벡터 추출 추가
-        
         # 6. Triple 점수 계산
         triple_cls_vectors = self.triple_scorer.encode_span_triples(
             triples=candidate_triples,
@@ -640,13 +616,10 @@ class Span_level_Graph_Pooling(nn.Module):
             token_embeddings=graph.x[token_mask],
             relation_embeddings=rel_emb
         )
-
         # CLS 벡터를 이용해서 스코어 계산
         span_level_scores = self.triple_scorer(
             cls_vectors=triple_cls_vectors  # 이미 얻은 CLS 벡터만 전달
         )
-
- 
         # 7. 점수에 따라 트리플 분리
         top_triples, top_scores, bottom_triples, bottom_scores, top_indices, bottom_indices = split_triples_by_score(
             triples=candidate_triples,
@@ -654,12 +627,25 @@ class Span_level_Graph_Pooling(nn.Module):
             threshold=self.pooling_threshold,
             return_indices=True
         )
-        
-        print(f"생성된 triple 수: {len(candidate_triples)}")
-        print(f"Top triple 수: {len(top_triples)}")
-        print("top_scores: ", top_scores)
-        
-        return candidate_triples, triple_cls_vectors, top_triples, top_scores, bottom_triples, bottom_scores, top_indices, bottom_indices, span_id_to_token_indices
+        print(f"\n트리플 분할 결과:")
+        print(f"- 상위 트리플 수: {len(top_triples)}")
+        print(f"- 하위 트리플 수: {len(bottom_triples)}")
+
+        # 8. 하위 트리플의 엣지 삭제
+        num_edges_before = graph.edge_index.size(1)
+        graph = remove_edges_of_bottom_triples(
+            graph,
+            bottom_triples
+        )
+        num_edges_after = graph.edge_index.size(1)
+        print(f"\n엣지 삭제 결과:")
+        print(f"- 삭제 전 엣지 수: {num_edges_before}")
+        print(f"- 삭제 후 엣지 수: {num_edges_after}")
+        print(f"- 삭제된 엣지 수: {num_edges_before - num_edges_after}")
+
+        return (candidate_triples, triple_cls_vectors, top_triples, top_scores, 
+                bottom_triples, bottom_scores, top_indices, bottom_indices, 
+                span_id_to_token_indices)
 
     def span_llm_alignment(self, 
                      input_text,
@@ -699,11 +685,6 @@ class Span_level_Graph_Pooling(nn.Module):
         
         input_text_embs = torch.stack(input_text_embs, dim=0).to(self.device)  # [B, H]
         
-        print(f"\n=== Input Text Embedding 생성 ===")
-        print(f"배치 크기: {input_text_embs.size(0)}")
-        print(f"임베딩 차원: {input_text_embs.size(1)}")
-
-        print('top_triples: ', len(top_triples))
 
         input_text_emb = input_text_embs.mean(dim=0)  # [H]
         
@@ -809,38 +790,38 @@ class Span_level_Graph_Pooling(nn.Module):
         # 업데이트할 노드 임베딩 초기화 (복사본 생성)
         updated_node_emb = graph.x.clone()
 
-        print("$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$")
-        print("top_indices: ", top_indices)
-        print("triples: ", triples[:3])
+        # 1. Entity 노드 업데이트
+        # head_ids: 각 top triple의 head entity ID를 모은 텐서
+        head_ids = torch.tensor([triples[idx][0] for idx in top_indices if idx < len(triples)], 
+                              device=device)
+        
+        # 각 head entity ID별로 등장 횟수를 계산
+        unique_heads, head_counts = torch.unique(head_ids, return_counts=True)
+        
+        # head entity별 가중치 계산 (uniform weights)
+        weights = torch.zeros(len(head_ids), device=device)
+        for i, head_id in enumerate(head_ids):
+            weights[i] = 1.0 / float(head_counts[unique_heads == head_id])
+        
+        # weighted cls vectors 계산
+        weighted_cls = top_cls_vectors * weights.unsqueeze(1)  # [K, D]
+        
+        # scatter_add로 한번에 업데이트
+        entity_update = torch.zeros_like(updated_node_emb)
+        entity_update.scatter_add_(0, head_ids.unsqueeze(1).expand(-1, weighted_cls.size(1)), weighted_cls)
+        
+        # Linear transformation 적용
+        entity_update = self.entity_linear(entity_update)
+        
+        # entity mask에 해당하는 노드만 업데이트
+        updated_node_emb[entity_mask] = entity_update[entity_mask]
 
-        # 1. 모든 entity 노드(head) 업데이트: head entity node가 포함된 triple의 cls 벡터를 모아 weighted average
-        for node_id in range(graph.x.size(0)):
-            if entity_mask[node_id]:
-                # 해당 entity가 head로 등장하는 top triple의 cls 벡터 모으기
-                selected_cls = []
-                for i, idx in enumerate(top_indices):
-                    if idx >= len(triples):
-                        print(f"Warning: Index {idx} is out of range for triples list of length {len(triples)}")
-                        continue
-                    h, _, _, _ = triples[idx]  # 원래 triples에서 상위 트리플 찾기
-                    if h == node_id:
-                        selected_cls.append(top_cls_vectors[i])  # top_cls_vectors의 i번째 벡터 사용
-                if len(selected_cls) > 0:
-                    cls_tensor = torch.stack(selected_cls, dim=0)  # [K, D]
-                    weights = torch.softmax(torch.ones(len(selected_cls), device=device), dim=0)  # uniform weight
-                    aggregated = torch.sum(cls_tensor * weights.unsqueeze(1), dim=0)  # [D]
-                    updated_node_emb[node_id] = aggregated
-
-        # 2. 모든 relation 노드 업데이트: 단순 linear layer transformation
-        updated_node_emb = self.update_relation_embedding(
-            node_emb=updated_node_emb,
-            node_type=graph.node_type
-        )
+        # 2. Relation 노드 업데이트: 단순 linear layer transformation
+        # relation 노드만 선형 변환
+        updated_node_emb[relation_mask] = self.relation_linear(updated_node_emb[relation_mask])
 
         # 최종 업데이트된 임베딩을 그래프에 반영
         graph.x = updated_node_emb
-        print(f"노드 임베딩 업데이트 완료 (span-level)")
-        print(f"전체 노드 임베딩 크기: {graph.x.size()}")
         return graph
 
 class Prediction(nn.Module):
@@ -917,7 +898,6 @@ class Prediction(nn.Module):
         
         # 스팬 정보가 있는 경우 convert_span_triples_to_text 사용
         if span_id_to_token_indices is not None and num_tokens is not None:
-            print("span 존재=======")
             node_id_to_token = {
                 "entity": token_to_text,
                 "relation": {i: rel for i, rel in enumerate(relation_types)}
@@ -940,7 +920,6 @@ class Prediction(nn.Module):
         
         # 스팬 정보가 없는 경우 기존 방식대로 처리
         else:
-            print("span 없음=======")
             for triple, score in zip(triples, triple_scores):
                 score_value = score.item() if isinstance(score, torch.Tensor) else score
                 if score_value >= self.relation_threshold:
@@ -1007,249 +986,254 @@ class Prediction(nn.Module):
         
         return predicted_relations
 
-class RePoolPredictor:
-    """
-    샘플/배치 단위로 예측과 loss를 모두 반환하는 통합 predictor.
-    model.py에서 이 클래스를 사용해 예측/로스 결과를 받아 최종 loss를 합산할 수 있음.
-    """
-    def __init__(self, relation_types, device=None):
-        self.relation_types = relation_types
-        self.device = device or (torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu"))
-        self.re_predictor = REPredictor(threshold=0.5)
-        self.relation_loss_fn = RelationLoss(relation_types=relation_types, device=self.device)
+# class RePoolPredictor:
+#     """
+#     샘플/배치 단위로 예측과 loss를 모두 반환하는 통합 predictor.
+#     model.py에서 이 클래스를 사용해 예측/로스 결과를 받아 최종 loss를 합산할 수 있음.
+#     """
+#     def __init__(self, relation_types, device=None):
+#         self.relation_types = relation_types
+#         self.device = device or (torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu"))
+#         self.re_predictor = REPredictor(threshold=0.1)
+#         self.relation_loss_fn = RelationLoss(relation_types=relation_types, device=self.device)
 
-    def predict_and_loss(self, sample, graph,
-                         span_top_triples, span_top_scores, 
-                         token_to_text, num_tokens,
-                         gold_relations, sentences,
-                         prefilter_loss, span_prefilter_loss,
-                         token_level_llm_loss, span_level_llm_loss):
-        """
-        예측 결과와 모든 loss를 반환
-        """
-        # 예측
-        relation_indices = [i - num_tokens for i, t in enumerate(graph.node_type) if t == 1]
-        predictions = self.re_predictor.predict(
-            num_tokens=num_tokens,
-            span_triples=span_top_triples if span_top_triples is not None else [],
-            span_scores=span_top_scores if span_top_scores is not None else torch.tensor([]),
-            token_to_text=token_to_text,
-            relation_indices=relation_indices
-        )
-        # gold relation flatten
-        flat_gold_relations = flatten_gold_relations(gold_relations, sentences)
-        # relation loss
-        relation_loss_val = self.relation_loss_fn(
-            predictions,
-            flat_gold_relations
-        )
-        # 최종 loss 합산
-        total_loss = (
-            prefilter_loss +
-            (span_prefilter_loss if span_prefilter_loss is not None else 0.0) +
-            token_level_llm_loss +
-            span_level_llm_loss +
-            relation_loss_val
-        )
-        return {
-            "predictions": predictions,
-            "relation_loss": relation_loss_val,
-            "prefilter_loss": prefilter_loss,
-            "span_prefilter_loss": span_prefilter_loss,
-            "token_level_llm_loss": token_level_llm_loss,
-            "span_level_llm_loss": span_level_llm_loss,
-            "final_loss": total_loss
-        }
+#     def predict_and_loss(self, sample, graph,
+#                          span_top_triples, span_top_scores, 
+#                          token_to_text, num_tokens,
+#                          gold_relations, sentences,
+#                          prefilter_loss, span_prefilter_loss,
+#                          token_level_llm_loss, span_level_llm_loss):
+#         """
+#         예측 결과와 모든 loss를 반환
+#         """
+#         # 예측
+#         relation_indices = [i - num_tokens for i, t in enumerate(graph.node_type) if t == 1]
+#         predictions = self.re_predictor.predict(
+#             num_tokens=num_tokens,
+#             span_triples=span_top_triples if span_top_triples is not None else [],
+#             span_scores=span_top_scores if span_top_scores is not None else torch.tensor([]),
+#             token_to_text=token_to_text,
+#             relation_indices=relation_indices
+#         )
+#         # gold relation flatten
+#         flat_gold_relations = flatten_gold_relations(gold_relations, sentences)
+#         # relation loss
+#         relation_loss_val = self.relation_loss_fn(
+#             predictions,
+#             flat_gold_relations
+#         )
+#         # 최종 loss 합산
+#         total_loss = (
+#             prefilter_loss +
+#             (span_prefilter_loss if span_prefilter_loss is not None else 0.0) +
+#             token_level_llm_loss +
+#             span_level_llm_loss +
+#             relation_loss_val
+#         )
+#         return {
+#             "predictions": predictions,
+#             "prefilter_loss": prefilter_loss,
+#             "span_prefilter_loss": span_prefilter_loss,
+#             "token_level_llm_loss": token_level_llm_loss,
+#             "span_level_llm_loss": span_level_llm_loss,
+#             "relation_loss": relation_loss_val,
+#             "final_loss": total_loss
+#         }
 
 #* ================================
-# if __name__ == "__main__":
-#     # 1. 데이터 로드
-#     with open("data/train_sample_scierc.json") as f:
-#         data = [json.loads(line) for line in f]
-#     sample = data[0]  # 첫 번째 샘플만 사용
+if __name__ == "__main__":
+    # 1. 데이터 로드
+    with open("data/train_sample_scierc.json") as f:
+        data = [json.loads(line) for line in f]
+    sample = data[0]  # 첫 번째 샘플만 사용
 
-#     # 2. 모델 초기화
-#     dual = Dual_View_BipartiteKG_Construction(bert_model_name="bert-base-uncased", hidden_size=768)
-#     token_level = Token_Level_Graph_Pooling(bert_model_name="bert-base-uncased", hidden_size=768)
-#     token_to_span = Token_to_Span_Composition(bert_model_name="bert-base-uncased", hidden_size=768)
-#     span_level = Span_level_Graph_Pooling(bert_model_name="bert-base-uncased", hidden_size=768)
-#     relation_types = [
-#             "USED-FOR", "FEATURE-OF", "HYPONYM-OF", "PART-OF", 
-#             "COMPARE", "CONJUNCTION", "EVALUATE-FOR"
-#         ]
+    # 2. 모델 초기화
+    dual = Dual_View_BipartiteKG_Construction(bert_model_name="bert-base-uncased", hidden_size=768)
+    token_level = Token_Level_Graph_Pooling(bert_model_name="bert-base-uncased", hidden_size=768)
+    token_to_span = Token_to_Span_Composition(bert_model_name="bert-base-uncased", hidden_size=768)
+    span_level = Span_level_Graph_Pooling(bert_model_name="bert-base-uncased", hidden_size=768)
+    relation_types = [
+            "USED-FOR", "FEATURE-OF", "HYPONYM-OF", "PART-OF", 
+            "COMPARE", "CONJUNCTION", "EVALUATE-FOR"
+        ]
 
-#     # 3. Entity Embeddings 생성
-#     # 문장별 토큰 길이 계산
-#     lengths = torch.tensor([len(sent) for sent in sample["sentences"]]).to(dual.device)
-#     token_out = dual.get_entity_embeddings(tokens=sample["sentences"], lengths=lengths)
-#     entity_embs = token_out["embeddings"]
-#     entity_mask = token_out["mask"]
-#     print(f"\n=== Entity Embeddings ===")
-#     print(f"Entity embeddings shape: {entity_embs.shape}")
-#     print(f"Entity mask shape: {entity_mask.shape}")
-#     print(f"Lengths: {lengths}")
+    # 3. Entity Embeddings 생성
+    # 문장별 토큰 길이 계산
+    lengths = torch.tensor([len(sent) for sent in sample["sentences"]]).to(dual.device)
+    token_out = dual.get_entity_embeddings(tokens=sample["sentences"], lengths=lengths)
+    entity_embs = token_out["embeddings"]
+    entity_mask = token_out["mask"]
+    print(f"\n=== Entity Embeddings ===")
+    print(f"Entity embeddings shape: {entity_embs.shape}")
+    print(f"Entity mask shape: {entity_mask.shape}")
+    print(f"Lengths: {lengths}")
 
-#     # 4. Relation Embeddings 생성
-#     # relation id는 relation_types의 인덱스
-#     relation_ids = torch.arange(len(dual.relation_types)).to(dual.device)
-#     rel_emb = dual.get_relation_embeddings(relation_ids)
-#     print(f"\n=== Relation Embeddings ===")
-#     print(f"Relation embeddings shape: {rel_emb.shape}")
+    # 4. Relation Embeddings 생성
+    # relation id는 relation_types의 인덱스
+    relation_ids = torch.arange(len(dual.relation_types)).to(dual.device)
+    rel_emb = dual.get_relation_embeddings(relation_ids)
+    print(f"\n=== Relation Embeddings ===")
+    print(f"Relation embeddings shape: {rel_emb.shape}")
 
-#     # 5. Entity Prefilter 적용
-#     # 라벨 생성 (NER spans 기반)
-#     prefilter_out = dual.get_entity_prefilter(entity_embs, entity_mask, sample["sentences"], sample["ner"])
-#     keep_mask = prefilter_out["keep_mask"]
-#     prefilter_loss = prefilter_out["prefilter_loss"]
+    # 5. Entity Prefilter 적용
+    # 라벨 생성 (NER spans 기반)
+    prefilter_out = dual.get_entity_prefilter(entity_embs, entity_mask, sample["sentences"], sample["ner"])
+    keep_mask = prefilter_out["keep_mask"]
+    prefilter_loss = prefilter_out["prefilter_loss"]
 
-#     print(f"\n=== Prefilter Results ===")
-#     print(f"Keep mask shape: {keep_mask.shape}")
-#     print(f"Prefilter loss: {prefilter_loss.item():.4f}")
+    print(f"\n=== Prefilter Results ===")
+    print(f"Keep mask shape: {keep_mask.shape}")
+    print(f"Prefilter loss: {prefilter_loss.item():.4f}")
 
-#     # 6. 이분 그래프 구성
-#     graph = dual.construct_graph(
-#         entity_embs=entity_embs,
-#         rel_emb=rel_emb,
-#         keep_mask=keep_mask,  
-#         actual_entity_length=lengths
-#     )
-#     print(f"\n=== Final Graph ===")
-#     print(f"Number of nodes: {graph.x.size(0)}")
-#     print(f"Number of edges: {graph.edge_index.size(1)}")
-#     if hasattr(graph, 'node_type'):
-#         print(f"Node types: {graph.node_type.unique().tolist()}")
-#     if hasattr(graph, 'edge_type'):
-#         print(f"Edge types: {graph.edge_type.unique().tolist()}")
+    # 6. 이분 그래프 구성
+    graph = dual.construct_graph(
+        entity_embs=entity_embs,
+        rel_emb=rel_emb,
+        keep_mask=keep_mask,  
+        actual_entity_length=lengths
+    )
+    print(f"\n=== Final Graph ===")
+    print(f"Number of nodes: {graph.x.size(0)}")
+    print(f"Number of edges: {graph.edge_index.size(1)}")
+    if hasattr(graph, 'node_type'):
+        print(f"Node types: {graph.node_type.unique().tolist()}")
+    if hasattr(graph, 'edge_type'):
+        print(f"Edge types: {graph.edge_type.unique().tolist()}")
 
-#     # 7. Token Level Graph Pooling
-#     graph, triples, triple_cls_vectors, top_triples, top_scores, bottom_triples, bottom_scores, top_indices, bottom_indices = token_level.process_token_triples(graph)
+    # 7. Token Level Graph Pooling
+    graph, triples, triple_cls_vectors, top_triples, top_scores, bottom_triples, bottom_scores, top_indices, bottom_indices = token_level.process_token_triples(graph)
 
-#     # top_triples가 없으면 스킵
-#     if top_triples is None or len(top_triples) == 0:
-#         print("Warning: No top token-level triples found! Skipping this sample.")
-#         token_level_llm_loss = torch.tensor(0.0, requires_grad=True)
-#     else:
-#         input_text = sample["sentences"]
-#         token_level_llm_loss = token_level.token_llm_alignment(
-#             input_text,
-#             relation_types,
-#             triple_cls_vectors,
-#             top_triples,
-#             top_scores, 
-#             bottom_triples, 
-#             bottom_scores, 
-#             top_indices, 
-#             bottom_indices)
-#         # 8. Token Level Validity-Aware Aggregation
-#         graph = token_level.validity_aware_aggregation(graph, triples, triple_cls_vectors, top_indices)
+    # top_triples가 없으면 스킵
+    if top_triples is None or len(top_triples) == 0:
+        print("Warning: No top token-level triples found! Skipping this sample.")
+        token_level_llm_loss = torch.tensor(0.0, requires_grad=True)
+    else:
+        input_text = sample["sentences"]
+        token_level_llm_loss = token_level.token_llm_alignment(
+            input_text,
+            relation_types,
+            triple_cls_vectors,
+            top_triples,
+            top_scores, 
+            bottom_triples, 
+            bottom_scores, 
+            top_indices, 
+            bottom_indices)
+        # 8. Token Level Validity-Aware Aggregation
+        graph = token_level.validity_aware_aggregation(graph, triples, triple_cls_vectors, top_indices)
 
-#     # 9. Token to Span Composition
-#     actual_length = lengths[0].item()  # 첫 번째 문장의 실제 길이
-#     graph, span_embs, span_ids, candidate_spans, span_prefilter_loss = token_to_span.compose(
-#         graph=graph,
-#         lengths=lengths,
-#         keep_mask=keep_mask, 
-#         sentences=sample["sentences"],
-#         ner_spans=sample["ner"],
-#         actual_length=actual_length,
-#         rel_emb=rel_emb
-#     )
+    # 9. Token to Span Composition
+    actual_length = lengths[0].item()  # 첫 번째 문장의 실제 길이
+    graph, span_embs, span_ids, candidate_spans, span_prefilter_loss = token_to_span.compose(
+        graph=graph,
+        lengths=lengths,
+        keep_mask=keep_mask, 
+        sentences=sample["sentences"],
+        ner_spans=sample["ner"],
+        actual_length=actual_length,
+        rel_emb=rel_emb
+    )
 
-#     # 10. Span Level Graph Pooling
-#     if span_ids is not None and candidate_spans is not None and len(candidate_spans) > 0:
-#         print(f"\n=== Span Level Graph Pooling ===")
-#         result = span_level.process_span_triples(graph, candidate_spans, span_ids, span_embs, rel_emb)
-#         if result is None:
-#             print("Warning: No valid span-level triples found! Skipping this sample.")
-#             span_level_llm_loss = torch.tensor(0.0, requires_grad=True)
-#         else:
-#             candidate_triples, triple_cls_vectors, span_top_triples, span_top_scores, span_bottom_triples, span_bottom_scores, span_top_indices, span_bottom_indices, span_id_to_token_indices = result
-#             # span_top_triples가 없으면 스킵
-#             if span_top_triples is None or len(span_top_triples) == 0:
-#                 print("Warning: No top span-level triples found! Skipping this sample.")
-#                 span_level_llm_loss = torch.tensor(0.0, requires_grad=True)
-#             else:
-#                 # Span Level LLM Alignment
-#                 span_level_llm_loss = span_level.span_llm_alignment(
-#                     input_text=input_text,
-#                     relation_types=relation_types,
-#                     triple_cls_vectors=triple_cls_vectors,
-#                     top_triples=span_top_triples,
-#                     top_scores=span_top_scores,
-#                     bottom_triples=span_bottom_triples,
-#                     bottom_scores=span_bottom_scores,
-#                     top_indices=span_top_indices,
-#                     bottom_indices=span_bottom_indices,
-#                     span_id_to_token_indices=span_id_to_token_indices,
-#                     num_tokens=len(span_id_to_token_indices),
-#                     candidate_spans=candidate_spans
-#                 )
-#                 # span level validity aware aggregation
-#                 graph = span_level.validity_aware_aggregation(graph, candidate_triples, triple_cls_vectors, span_top_indices)
+    # 10. Span Level Graph Pooling
+    if span_ids is not None and candidate_spans is not None and len(candidate_spans) > 0:
+        print(f"\n=== Span Level Graph Pooling ===")
+        result = span_level.process_span_triples(graph, candidate_spans, span_ids, span_embs, rel_emb)
+        if result is None:
+            print("Warning: No valid span-level triples found! Skipping this sample.")
+            span_level_llm_loss = torch.tensor(0.0, requires_grad=True)
+        else:
+            candidate_triples, triple_cls_vectors, span_top_triples, span_top_scores, span_bottom_triples, span_bottom_scores, span_top_indices, span_bottom_indices, span_id_to_token_indices = result
+            # span_top_triples가 없으면 스킵
+            if span_top_triples is None or len(span_top_triples) == 0:
+                print("Warning: No top span-level triples found! Skipping this sample.")
+                span_level_llm_loss = torch.tensor(0.0, requires_grad=True)
+            else:
+                # Span Level LLM Alignment
+                span_level_llm_loss = span_level.span_llm_alignment(
+                    input_text=input_text,
+                    relation_types=relation_types,
+                    triple_cls_vectors=triple_cls_vectors,
+                    top_triples=span_top_triples,
+                    top_scores=span_top_scores,
+                    bottom_triples=span_bottom_triples,
+                    bottom_scores=span_bottom_scores,
+                    top_indices=span_top_indices,
+                    bottom_indices=span_bottom_indices,
+                    span_id_to_token_indices=span_id_to_token_indices,
+                    num_tokens=len(span_id_to_token_indices),
+                    candidate_spans=candidate_spans
+                )
+                # span level validity aware aggregation
+                graph = span_level.validity_aware_aggregation(graph, candidate_triples, triple_cls_vectors, span_top_indices)
 
-#             # === Final Results & Relation Extraction ===
-#             print(f"\n=== Final Results ===")
-#             print(f"Token Level LLM Loss: {token_level_llm_loss.item():.4f}")
-#             print(f"Span Level LLM Loss: {span_level_llm_loss.item():.4f}")
+            # === Final Results & Relation Extraction ===
+            print(f"\n=== Final Results ===")
+            print(f"Token Level LLM Loss: {token_level_llm_loss.item():.4f}")
+            print(f"Span Level LLM Loss: {span_level_llm_loss.item():.4f}")
 
-#             print(f"\n=== Relation Extraction Prediction ===")
-#             # 토큰/스팬 텍스트 매핑 생성
-#             tokens = [token for sent in sample["sentences"] for token in sent]
-#             token_to_text = {i: token for i, token in enumerate(tokens)}
+            print(f"\n=== Relation Extraction Prediction ===")
+            # 토큰/스팬 텍스트 매핑 생성
+            tokens = [token for sent in sample["sentences"] for token in sent]
+            token_to_text = {i: token for i, token in enumerate(tokens)}
 
-#             num_tokens = len(tokens)
-#             for rel_idx, rel_type in enumerate(relation_types):
-#                 token_to_text[num_tokens + rel_idx] = rel_type
-#             num_relations = len(relation_types)
-#             for span_idx, (start, end) in enumerate(candidate_spans):
-#                 token_to_text[num_tokens + num_relations + span_idx] = " ".join(tokens[start:end+1])
-#             predictor = REPredictor(threshold=0.5)
-#             relation_indices = [i - num_tokens for i, t in enumerate(graph.node_type) if t == 1]
+            num_tokens = len(tokens)
+            for rel_idx, rel_type in enumerate(relation_types):
+                token_to_text[num_tokens + rel_idx] = rel_type
+            num_relations = len(relation_types)
+            for span_idx, (start, end) in enumerate(candidate_spans):
+                token_to_text[num_tokens + num_relations + span_idx] = " ".join(tokens[start:end+1])
+            re_predictor = REPredictor(threshold=0.7)
+            relation_indices = [i - num_tokens for i, t in enumerate(graph.node_type) if t == 1]
 
-#             predictions = predictor.predict(
-#                 num_tokens=num_tokens,
-#                 span_triples=span_top_triples,
-#                 span_scores=span_top_scores,
-#                 token_to_text=token_to_text,
-#                 relation_indices=relation_indices
-#             )
-#             print("\nExtracted Relations:")
-#             for head_text, rel_type, tail_text, confidence in predictions:
-#                 print(f"- {head_text} --[{rel_type}]--> {tail_text} (confidence: {confidence:.4f})")
-#             # Relation Loss 계산
-#             score_tensors = []
-#             if top_scores is not None and isinstance(top_scores, torch.Tensor) and top_scores.numel() > 0:
-#                 score_tensors.append(top_scores)
-#             if span_top_scores is not None and isinstance(span_top_scores, torch.Tensor) and span_top_scores.numel() > 0:
-#                 score_tensors.append(span_top_scores)
+            predictions = re_predictor.predict(
+                num_tokens=num_tokens,
+                span_triples=span_top_triples,
+                span_scores=span_top_scores,
+                token_to_text=token_to_text,
+                relation_indices=relation_indices
+            )
+            print("\nExtracted Relations:")
+            for head_text, rel_type, tail_text, confidence in predictions:
+                print(f"- {head_text} --[{rel_type}]--> {tail_text} (confidence: {confidence:.4f})")
+            # Relation Loss 계산
+            score_tensors = []
+            if top_scores is not None and isinstance(top_scores, torch.Tensor) and top_scores.numel() > 0:
+                score_tensors.append(top_scores)
+            if span_top_scores is not None and isinstance(span_top_scores, torch.Tensor) and span_top_scores.numel() > 0:
+                score_tensors.append(span_top_scores)
 
-#             if len(score_tensors) > 0:
-#                 predicted_scores = torch.cat(score_tensors)
-#             else:
-#                 predicted_scores = torch.tensor([], dtype=torch.float32)
+            if len(score_tensors) > 0:
+                predicted_scores = torch.cat(score_tensors)
+            else:
+                predicted_scores = torch.tensor([], dtype=torch.float32)
 
-#             relation_loss = RelationLoss(relation_types=relation_types)
-#             # gold_relations flatten
-#             flat_gold_relations = flatten_gold_relations(sample.get("relations", []), sample["sentences"])
-#             relation_loss_val = relation_loss(
-#                 predictions,
-#                 flat_gold_relations
-#             )
-#             print(f"\nLosses:")
-#             print(f"Token Level LLM Loss: {token_level_llm_loss.item():.4f}")
-#             print(f"Span Level LLM Loss: {span_level_llm_loss.item():.4f}")
-#             print(f"Relation Prediction Loss: {relation_loss_val.item():.4f}")
-#             print(f"Prefilter Loss: {prefilter_loss.item():.4f}")
-#             print(f"Span Prefilter Loss: {span_prefilter_loss.item():.4f}")
-#             total_loss = (
-#                             prefilter_loss +
-#                             (span_prefilter_loss if span_prefilter_loss is not None else 0.0) +
-#                             token_level_llm_loss +
-#                             span_level_llm_loss +
-#                             relation_loss_val
-#                         )
-#             print(f"Total Loss: {total_loss.item():.4f}")
-#     else:
-#         print("Warning: No valid candidate spans found! Skipping span-level processing.")
-#         span_level_llm_loss = torch.tensor(0.0, requires_grad=True)
-#         print("\nSkipping Span Level Processing: No valid spans found")
+            relation_loss = RelationLoss(relation_types=relation_types)
+            # gold_relations flatten
+            relations = sample.get("relations", [])
+            print("relations: ", relations)
+            flat_gold_relations = flatten_gold_relations(sample.get("relations", []), sample["sentences"])
+            print("[DEBUG-prediction] flat_gold_relations:", flat_gold_relations)
+            
+            relation_loss_val = relation_loss(
+                predictions,
+                flat_gold_relations
+            )
+            print("predictions: ", predictions)
+            print(f"\nLosses:")
+            print(f"Token Level LLM Loss: {token_level_llm_loss.item():.4f}")
+            print(f"Span Level LLM Loss: {span_level_llm_loss.item():.4f}")
+            print(f"Relation Prediction Loss: {relation_loss_val.item():.4f}")
+            print(f"Prefilter Loss: {prefilter_loss.item():.4f}")
+            print(f"Span Prefilter Loss: {span_prefilter_loss.item():.4f}")
+            total_loss = (
+                            prefilter_loss +
+                            (span_prefilter_loss if span_prefilter_loss is not None else 0.0) +
+                            token_level_llm_loss +
+                            span_level_llm_loss +
+                            relation_loss_val
+                        )
+            print(f"Total Loss: {total_loss.item():.4f}")
+    else:
+        print("Warning: No valid candidate spans found! Skipping span-level processing.")
+        span_level_llm_loss = torch.tensor(0.0, requires_grad=True)
+        print("\nSkipping Span Level Processing: No valid spans found")

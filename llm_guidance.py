@@ -89,7 +89,7 @@ class TripleSetEncoder(nn.Module):
 
 
 
-def verbalize_triple(h: str, r: str, t: str, r_type: str) -> str:
+def verbalize_triple(h: str, r: str, t: str) -> str:
     """
     Convert a single (head, relation, tail) triple to a natural language sentence.
     """
@@ -102,13 +102,9 @@ def verbalize_triple(h: str, r: str, t: str, r_type: str) -> str:
         'HYPONYM-OF': 'is a kind of',
         'CONJUNCTION': 'and',
     }
-    if r_type == "semantic":
-        if r in relation_map:
-            return f"{h} {relation_map[r]} {t}"
-        else:
-            return f"{h} {r} {t}."
-    elif r_type == "compound":
-        return f"{h} is compound with {t}"
+
+    if r in relation_map:
+        return f"{h} {relation_map[r]} {t}"
     else:
         return f"{h} {r} {t}."
 
@@ -135,7 +131,7 @@ def verbalize_triples(triples: List[Tuple[str, str, str, str]], level: str) -> s
     if level == 'token':
         sentences = [verbalize_token_triple(h, r, t) for (h, r, t) in triples] #  
     elif level == 'span': # span
-        sentences = [verbalize_triple(h, r, t, r_type) for (h, r, t, r_type) in triples]
+        sentences = [verbalize_triple(h, r, t) for (h, r, t) in triples]
 
     return " ".join(sentences)
 

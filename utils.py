@@ -244,7 +244,7 @@ def filter_candidate_spans(span_scores, candidate_spans, threshold=0.5):
 
 
 #  토큰 노드와 relation 노드 사이의 엣지 정보
-# (token_id, rel_id, rel_node_id) 형태
+# (token_id, rel_id, rel_node_id, edge_type) 형태
 def extract_token_relation_edges(data):
     """
     Extract edges from token (entity) nodes to relation nodes.
@@ -260,10 +260,11 @@ def extract_token_relation_edges(data):
             - node_type: [num_nodes] - node type (0: token, 1: relation, 2: span)
 
     Returns:
-        List of (token_node_id, rel_id, rel_node_id)
+        List of (token_node_id, rel_id, rel_node_id, edge_type)
         - token_node_id: token 노드의 ID
         - rel_id: relation type의 ID
         - rel_node_id: relation 노드의 ID
+        - edge_type: 엣지 타입 (0/1/2)
     """
     edge_index = data.edge_index      # [2, num_edges]
     edge_type = data.edge_type        # [num_edges]
@@ -303,23 +304,23 @@ def extract_token_relation_edges(data):
             # token -> relation
             if node_type[src] == 0 and node_type[tgt] == 1:
                 rel_id = rel_id_mapping[tgt]
-                token_rel_edges.append((src, rel_id, tgt))
+                token_rel_edges.append((src, rel_id, tgt, edge_t))
                 
         elif edge_t == CAN_FORM_OBJECT_OF:
             # relation -> token
             if node_type[src] == 1 and node_type[tgt] == 0:
                 rel_id = rel_id_mapping[src]
-                token_rel_edges.append((tgt, rel_id, src))  # 순서 주의: token이 앞으로
+                token_rel_edges.append((tgt, rel_id, src, edge_t))  # 순서 주의: token이 앞으로
                 
         elif edge_t == CAN_FORM_COMPOUND_WITH:
             # token -> token
             if node_type[src] == 0 and node_type[tgt] == 0:
-                token_rel_edges.append((src, edge_t, tgt))
+                token_rel_edges.append((src, edge_t, tgt, edge_t))
     
     # 엣지 타입별 통계
-    subject_edges = sum(1 for _, rel_id, _ in token_rel_edges if rel_id == CAN_FORM_SUBJECT_OF)
-    object_edges = sum(1 for _, rel_id, _ in token_rel_edges if rel_id == CAN_FORM_OBJECT_OF)
-    compound_edges = sum(1 for _, rel_id, _ in token_rel_edges if rel_id == CAN_FORM_COMPOUND_WITH)
+    subject_edges = sum(1 for _, rel_id, _, et in token_rel_edges if et == CAN_FORM_SUBJECT_OF)
+    object_edges = sum(1 for _, rel_id, _, et in token_rel_edges if et == CAN_FORM_OBJECT_OF)
+    compound_edges = sum(1 for _, rel_id, _, et in token_rel_edges if et == CAN_FORM_COMPOUND_WITH)
     
     print(f"\n추출된 엣지 통계:")
     print(f"- 전체 엣지 수: {len(token_rel_edges)}")
@@ -330,38 +331,32 @@ def extract_token_relation_edges(data):
     
     return token_rel_edges
 
-def create_span_relation_edges(token_rel_edges: List[Tuple[int, int, int]], 
+def create_span_relation_edges(token_rel_edges: List[Tuple[int, int, int, int]], 
                              candidate_spans: List[Tuple[int, int]],
-                             span_ids: List[int]) -> List[Tuple[int, int, int]]:
+                             span_ids: List[int]) -> List[Tuple[int, int, int, int]]:
     """
     Create edges between span nodes and relation nodes based on token-relation edges.
-    
     Args:
-        token_rel_edges: List[Tuple[int, int, int]] - (token_id, rel_id, rel_node_id)
+        token_rel_edges: List[Tuple[int, int, int, int]] - (token_id, rel_id, rel_node_id, edge_type)
         candidate_spans: List[Tuple[int, int]] - (start_idx, end_idx)
         span_ids: List[int] - span node indices
-        
     Returns:
-        span_rel_edges: List[Tuple[int, int, int]] - (span_id, rel_id, rel_node_id)
+        span_rel_edges: List[Tuple[int, int, int, int]] - (span_id, rel_id, rel_node_id, edge_type)
     """
     span_rel_edges = []
-    
     # span_id -> 포함된 token indices 매핑 생성
     span_id_to_token_indices = {
         span_ids[i]: list(range(start, end + 1))
         for i, (start, end) in enumerate(candidate_spans)
     }
-    
     # 각 span에 대해 포함된 토큰들의 relation 정보 수집
     for span_id, token_list in span_id_to_token_indices.items():
         for token_id in token_list:
-            for t_id, rel_id, rel_node_id in token_rel_edges:
+            for t_id, rel_id, rel_node_id, edge_type in token_rel_edges:
                 if token_id == t_id:
-                    span_rel_edges.append((span_id, rel_id, rel_node_id))
-    
+                    span_rel_edges.append((span_id, rel_id, rel_node_id, edge_type))
     # 중복 제거 (span 내부에 동일한 relation이 여러 번 등장할 경우 대비)
     span_rel_edges = list(set(span_rel_edges))
-    
     return span_rel_edges
 
 def extract_span_token_candidate_triples(

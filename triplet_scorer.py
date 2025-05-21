@@ -148,7 +148,7 @@ class BERTTripleScorer(nn.Module):
         num_tokens = token_embeddings.size(0)  # 토큰 노드 수
         num_relations = relation_embeddings.size(0) if relation_embeddings is not None else 0  # relation 노드 수
         
-        for h_id, rel_id, t_id, r_type in triples:
+        for h_id, rel_id, t_id in triples:
             # 1. Head 노드 임베딩 선택
             if h_id < num_tokens:  # token 노드
                 h_tok = token_embeddings[h_id]
@@ -278,8 +278,6 @@ def extract_candidate_triples(graph):
     
     Args:
         data: PyG Data object
-        compound_edge_type: int - compound 엣지의 타입 ID
-        max_triples: int - 최대 트리플 수 (기본값 10000)
     """
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -470,7 +468,7 @@ def convert_span_triples_to_text(triples: List[Tuple[int, int, int, str]],
         num_tokens: int - 개별 토큰의 수 (span 노드 제외)
     """
     converted_triples = []
-    for (h, r, t, r_type) in triples:
+    for (h, r, t) in triples:
         # head text 변환
         if h < num_tokens:  # token node
             h_text = node_id_to_token.get(h, f"UNK_{h}")
@@ -489,7 +487,7 @@ def convert_span_triples_to_text(triples: List[Tuple[int, int, int, str]],
         # relation 노드 id는 num_tokens ~ num_tokens+num_relations-1
         r_text = node_id_to_token.get(r, f"UNK_{r}")
 
-        converted_triples.append((h_text, r_text, t_text, r_type))
+        converted_triples.append((h_text, r_text, t_text))
     return converted_triples
 
 
@@ -573,55 +571,33 @@ def remove_edges_of_bottom_token_triples(
 #* 하위 트리플 엣지 삭제 _ Span-level (e,r,e) 트리플
 def remove_edges_of_bottom_triples(
     data: Data,
-    bottom_triples: List[Tuple[int, int, int, str]],
-    semantic_type_id: int = 2,
-    compound_type_ids: Tuple[int, int] = (0, 1)
+    bottom_triples: List[Tuple[int, int, int]]
 ) -> Data:
     """
-    Remove specific edges in the graph based on bottom triples and their type.
+    Remove specific edges in the graph based on bottom triples.
 
     Args:
         data: PyG Data object with edge_index and edge_type
-        bottom_triples: list of (head_id, rel_id, tail_id, r_type)
-        semantic_type_id: int, relation type id for SEMANTIC
-        compound_type_ids: (int, int), relation type ids for compound edges
+        bottom_triples: list of (head_id, rel_id, tail_id)
 
     Returns:
         data: PyG Data with filtered edge_index and edge_type
     """
-
     edge_index = data.edge_index  # [2, E]
     edge_type = data.edge_type    # [E]
 
     keep_mask = torch.ones(edge_index.size(1), dtype=torch.bool, device=edge_index.device)
 
-    for h, r, t, r_type in bottom_triples:
-        if r_type == "semantic":
-            # Find rel_node → tail_node, semantic edge
-            match = (
-                (edge_index[0] == r) & (edge_index[1] == t) & (edge_type == semantic_type_id)
-            )
-            keep_mask = keep_mask & (~match)
-
-        elif r_type == "compound":
-            # Remove BOTH directions
-            forward_match = (
-                (edge_index[0] == h) & (edge_index[1] == t) & (edge_type == compound_type_ids[0])
-            )
-            backward_match = (
-                (edge_index[0] == t) & (edge_index[1] == h) & (edge_type == compound_type_ids[1])
-            )
-            match = forward_match | backward_match
-            keep_mask = keep_mask & (~match)
-
-        else:
-            continue  # unknown type, skip
+    for h, r, t in bottom_triples:
+        # 해당 triple의 edge type과 일치하는 엣지 찾아서 삭제
+        match = (
+            (edge_index[0] == h) & (edge_index[1] == t) & (edge_type == r)
+        )
+        keep_mask = keep_mask & (~match)
 
     # Apply filtering
     data.edge_index = edge_index[:, keep_mask]
     data.edge_type = edge_type[keep_mask]
-    # if hasattr(data, "edge_attr"):
-    #     data.edge_attr = data.edge_attr[keep_mask]
 
     return data
 
@@ -632,79 +608,87 @@ def remove_edges_of_bottom_triples(
 def extract_span_token_candidate_triples(
     token_ids: List[int],
     span_ids: List[int],
-    span_relation_candidates: Dict[int, Set[int]],
+    node_relation_candidates: Dict[int, Dict[int, Set[int]]],  # {node_id: {edge_type: set(rel_id)}}
     span_id_to_token_indices: Dict[int, List[int]],
     relation_types: List[str],
     max_triples: int = 10000
-) -> List[Tuple[int, int, int, int]]:  # r_type을 int로 변경
+) -> List[Tuple[int, int, int]]:
     """
     Generate candidate triples including:
-    - token-token triples
-    - token-span triples (in both directions)
-    - span-span triples
+    - token-token, token-span, span-token, span-span
+    모두 head는 can_form_subject_of(0), tail은 can_form_object_of(1)로 같은 relation에 연결된 경우만 triple로 생성
     
     With constraints:
     - No self-loops (head != tail)
-    - No triples between span and its internal tokens
+    - No triples between span and its internal tokens (for token-span, span-token)
     
     Args:
         token_ids: List of token node IDs
         span_ids: List of span node IDs
-        span_relation_candidates: Mapping from span_id to set of possible relation IDs
+        node_relation_candidates: {node_id: {edge_type: set(rel_id)}}
         span_id_to_token_indices: Mapping from span_id to list of contained token IDs
         relation_types: List of relation type strings
-        max_triples: Maximum number of triples to generate
-        
     Returns:
-        triples: List of (head_id, rel_id, tail_id, rel_type) tuples
+        triples: List of (head_id, rel_id, tail_id) tuples
     """
     triples = []
-    
-    # 1. Token-Token triples (using existing function)
-    token_graph_data = Data(
-        edge_index=torch.tensor([[h, t] for h in token_ids for t in token_ids if h != t]).t(),
-        edge_type=torch.zeros(len(token_ids) * (len(token_ids)-1), dtype=torch.long),  # compound type
-        node_type=torch.zeros(max(token_ids) + 1, dtype=torch.long)  # all tokens are type 0
-    )
-    token_triples = extract_candidate_triples(token_graph_data)
-    triples.extend(token_triples)
-    
-    # 2. Token-Span triples
-    for token_id in token_ids:
-        for span_id in span_ids:
-            # Skip if token is inside the span
-            if token_id in span_id_to_token_indices.get(span_id, []):
+
+    # 1. token-token
+    for head in token_ids:
+        for tail in token_ids:
+            if head == tail:
                 continue
-                
-            # Get possible relations for this span
-            for rel_id in span_relation_candidates.get(span_id, set()):
-                # token → span
-                triples.append((token_id, rel_id, span_id, "semantic"))
-                # span → token
-                triples.append((span_id, rel_id, token_id, "semantic"))
-    
-    # 3. Span-Span triples
-    for i, span_id1 in enumerate(span_ids):
-        for span_id2 in span_ids[i+1:]:  # avoid self-loops and duplicates
-            # Get shared relations between the two spans
-            shared_rels = span_relation_candidates.get(span_id1, set()).intersection(
-                span_relation_candidates.get(span_id2, set())
-            )
-            
+            rels_head = set(node_relation_candidates.get(head, {}).get(0, set()))
+            rels_tail = set(node_relation_candidates.get(tail, {}).get(1, set()))
+            shared_rels = rels_head & rels_tail
             for rel_id in shared_rels:
-                triples.append((span_id1, rel_id, span_id2, "semantic"))
-                triples.append((span_id2, rel_id, span_id1, "semantic"))
-    
-    # 4. Apply max_triples limit if needed
+                triples.append((head, rel_id, tail))
+
+    # 2. token-span
+    for head in token_ids:
+        for tail in span_ids:
+            # token이 span 내부 토큰이면 제외
+            if head in span_id_to_token_indices.get(tail, []):
+                continue
+            rels_head = set(node_relation_candidates.get(head, {}).get(0, set()))
+            rels_tail = set(node_relation_candidates.get(tail, {}).get(1, set()))
+            shared_rels = rels_head & rels_tail
+            for rel_id in shared_rels:
+                triples.append((head, rel_id, tail))
+
+    # 3. span-token
+    for head in span_ids:
+        for tail in token_ids:
+            # token이 span 내부 토큰이면 제외
+            if tail in span_id_to_token_indices.get(head, []):
+                continue
+            rels_head = set(node_relation_candidates.get(head, {}).get(0, set()))
+            rels_tail = set(node_relation_candidates.get(tail, {}).get(1, set()))
+            shared_rels = rels_head & rels_tail
+            for rel_id in shared_rels:
+                triples.append((head, rel_id, tail))
+
+    # 4. span-span
+    for head in span_ids:
+        for tail in span_ids:
+            if head == tail:
+                continue
+            rels_head = set(node_relation_candidates.get(head, {}).get(0, set()))
+            rels_tail = set(node_relation_candidates.get(tail, {}).get(1, set()))
+            shared_rels = rels_head & rels_tail
+            for rel_id in shared_rels:
+                triples.append((head, rel_id, tail))
+
+    # 5. max_triples 제한
     if len(triples) > max_triples:
         print(f"\n트리플 수가 상한선({max_triples})을 초과하여 랜덤 샘플링을 수행합니다.")
         triples = random.sample(triples, max_triples)
-        
-    # Print statistics
+
     print(f"\n=== 생성된 트리플 통계 ===")
     print(f"전체 트리플 수: {len(triples)}")
     print(f"- Token-Token 트리플 수: {sum(1 for t in triples if t[0] in token_ids and t[2] in token_ids)}")
-    print(f"- Token-Span 트리플 수: {sum(1 for t in triples if (t[0] in token_ids and t[2] in span_ids) or (t[0] in span_ids and t[2] in token_ids))}")
+    print(f"- Token-Span 트리플 수: {sum(1 for t in triples if t[0] in token_ids and t[2] in span_ids)}")
+    print(f"- Span-Token 트리플 수: {sum(1 for t in triples if t[0] in span_ids and t[2] in token_ids)}")
     print(f"- Span-Span 트리플 수: {sum(1 for t in triples if t[0] in span_ids and t[2] in span_ids)}")
-    
+
     return triples
